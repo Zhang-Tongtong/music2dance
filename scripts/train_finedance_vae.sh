@@ -1,0 +1,37 @@
+#!/bin/bash
+
+python -m mld.train_mvae \
+    --exp_name mvae_finedance_h2_f8_r8 \
+    --data_args.dataset finedance \
+    --data_args.data_dir ./data/finedance \
+    --data_args.cfg_path ./config_files/config_hydra/motion_primitive/finedance_h2_f8_r8.yaml \
+    --data_args.enforce_gender male \
+    --data_args.enforce_zero_beta 1 \
+    --data_args.body_type smplx \
+    --data_args.weight_scheme uniform \
+    --model_args.nfeats 276 \
+    --model_args.latent_dim 1 256 \
+    --model_args.h_dim 256 \
+    --model_args.num_layers 7 \
+    --model_args.ff_size 1024 \
+    --model_args.num_heads 4 \
+    --model_args.arch all_encoder \
+    --train_args.batch_size 128 \
+    --train_args.learning_rate 1e-4 \
+    --train_args.stage1_steps 100000 \
+    --train_args.stage2_steps 50000 \
+    --train_args.stage3_steps 50000 \
+    --train_args.weight_kl 1e-6 \
+    --train_args.weight_rec 1.0 \
+    --train_args.weight_smpl_joints_rec 10.0 \
+    --train_args.weight_joints_consistency 10.0 \
+    --train_args.weight_joints_delta 100.0 \
+    --train_args.weight_transl_delta 100.0 \
+    --train_args.weight_orient_delta 100.0 \
+    --train_args.save_interval 50000 \
+    --train_args.val_interval 10000 \
+    --train_args.log_interval 1000 \
+    --train_args.ema_decay 0.999 \
+    --seed 0 \
+    --device cuda \
+    --track 1

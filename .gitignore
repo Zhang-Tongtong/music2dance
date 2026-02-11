@@ -1,0 +1,31 @@
+cat > .gitignore <<'EOF'
+# data / outputs
+data/
+results/
+output/
+logs/
+wandb/
+
+# checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+
+# media
+*.wav
+*.mp4
+*.png
+*.jpg
+*.zip
+*.tar
+*.tar.gz
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+EOF
