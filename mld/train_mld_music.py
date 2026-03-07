@@ -86,9 +86,9 @@ class DenoiserArgs:
     mvae_path: str = ''
     rescale_latent: int = 1
 
-    train_rollout_type: Literal["single", "full"] = "single"
+    train_rollout_type: Literal["single", "full"] = "full"
     """whether to use the full denoising loop to generate the previous primitive or a single step in rollout training"""
-    train_rollout_history: str = "gt"  # "rollout" or "gt"
+    train_rollout_history: str = "rollout"  # "rollout" or "gt"
 
     model_type: str = "mlp"
     model_args: DenoiserMLPArgs | DenoiserTransformerArgs = DenoiserMLPArgs()
@@ -266,7 +266,11 @@ class Trainer:
             **asdict(mvae_args.model_args),
         ).to(device)
         checkpoint = torch.load(denoiser_args.mvae_path)
-        model_state_dict = checkpoint['model_state_dict']
+        # model_state_dict = checkpoint['model_state_dict']
+        if 'model_avg_state_dict' in checkpoint:
+            model_state_dict = checkpoint['model_avg_state_dict']
+        else:
+            model_state_dict = checkpoint['model_state_dict']
         if 'latent_mean' not in model_state_dict:
             model_state_dict['latent_mean'] = torch.tensor(0)
         if 'latent_std' not in model_state_dict:
@@ -323,6 +327,7 @@ class Trainer:
         self.step = start_step
 
         self.rec_criterion = torch.nn.HuberLoss(reduction='mean', delta=1.0)
+        self.scaler = amp.GradScaler(enabled=bool(args.train_args.use_amp))
         self.transf_rotmat = torch.eye(3, device=self.device).unsqueeze(0)
         self.transf_transl = torch.zeros(3, device=self.device).reshape(1, 1, 3)
 
@@ -461,6 +466,9 @@ class Trainer:
         }
         x_start_pred = self.denoiser_model(x_t=x_t, timesteps=self.diffusion._scale_timesteps(t), y=y)  # [B, T=1, D]
         latent_pred = x_start_pred.permute(1, 0, 2)  # [T=1, B, D]
+        if torch.isnan(latent_pred).any() or torch.isinf(latent_pred).any():
+            print("latent_pred exploded")
+            exit()
 
         future_motion_pred = self.vae_model.decode(latent_pred, history_motion, nfuture=future_length,
                                                    scale_latent=denoiser_args.rescale_latent)  # [B, F, D], normalized
@@ -470,7 +478,8 @@ class Trainer:
         if self.step > train_args.stage1_steps and self.args.denoiser_args.train_rollout_type == "full":  # sample with full ddpm loop to get rollout history
             sample_fn = self.diffusion.p_sample_loop
             with torch.no_grad():
-                with amp.autocast(enabled=bool(train_args.use_amp), dtype=torch.float16):
+                # with amp.autocast(enabled=bool(train_args.use_amp), dtype=torch.float16):
+                with amp.autocast(enabled=False):
                     x_start_pred = sample_fn(
                         self.denoiser_model,
                         x_start.shape,
@@ -531,9 +540,19 @@ class Trainer:
 
                 # optimize
                 optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
-                optimizer.step()
+                if train_args.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)   # 让 clip 用 fp32 梯度
+                    nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
+                    optimizer.step()
+                # loss.backward()
+                # nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
+                # optimizer.step()
 
                 # update the average model using exponential moving average
                 if train_args.ema_decay > 0:

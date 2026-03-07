@@ -20,7 +20,67 @@ from data_loaders.humanml.data.dataset_finedance import FineDanceDataset
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from diffusion import gaussian_diffusion as gd
 from utils.smpl_utils import PrimitiveUtility
+# from smplx import SMPLX
 
+# def rebuild_276_consistent(motion_276: torch.Tensor, smpl_model) -> torch.Tensor:
+#     """
+#     motion_276: [T,276]  (原始空间 or 归一化空间都行，但你必须传入“原始空间”的才有物理意义)
+#     return: [T,276]  保证 joints 和 delta 与 transl+poses 一致
+#     """
+#     import torch
+#     from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
+
+#     T = motion_276.shape[0]
+#     out = motion_276.clone()
+
+#     # 1) 取 transl + poses_6d
+#     transl = out[:, 0:3]
+#     poses6d = out[:, 3:135].reshape(T, 22, 6)  # global(1)+body(21)
+
+#     # 2) 6D 正交化（一定要做，避免数值漂）
+#     def gram_schmidt_6d(x):
+#         a1 = x[..., 0:3]
+#         a2 = x[..., 3:6]
+#         b1 = a1 / (torch.norm(a1, dim=-1, keepdim=True) + 1e-8)
+#         dot = torch.sum(a2 * b1, dim=-1, keepdim=True)
+#         b2 = a2 - dot * b1
+#         b2 = b2 / (torch.norm(b2, dim=-1, keepdim=True) + 1e-8)
+#         return torch.cat([b1, b2], dim=-1)
+
+#     poses6d = gram_schmidt_6d(poses6d)
+
+#     # 3) 转 rotation matrix，喂 SMPL-X 重新算 joints
+#     R = rotation_6d_to_matrix(poses6d.reshape(-1, 6)).reshape(T, 22, 3, 3)
+#     global_orient = R[:, 0]          # [T,3,3]
+#     body_pose = R[:, 1:]             # [T,21,3,3]
+
+#     # smpl_model forward：取 joints (22,3)
+#     # 这里假设你 smpl_model 的 forward 支持 global_orient/body_pose/transl
+#     smpl_out = smpl_model(global_orient=global_orient, body_pose=body_pose, transl=transl)
+#     joints = smpl_out.joints[:, :22, :]  # [T,22,3]
+
+#     # 4) 写回 joints (66)
+#     out[:, 135:201] = joints.reshape(T, 66)
+
+#     # 5) 重新计算 deltas（用相邻帧差分，第一帧 delta=0）
+#     transl_delta = torch.zeros_like(transl)
+#     transl_delta[1:] = transl[1:] - transl[:-1]
+
+#     rot6d = matrix_to_rotation_6d(R.reshape(-1, 3, 3)).reshape(T, 22, 6)
+#     rot6d_delta = torch.zeros_like(rot6d)
+#     rot6d_delta[1:] = rot6d[1:] - rot6d[:-1]
+
+#     joints_delta = torch.zeros_like(joints)
+#     joints_delta[1:] = joints[1:] - joints[:-1]
+
+#     out[:, 201:204] = transl_delta
+#     out[:, 204:210] = rot6d_delta[:, 0].reshape(T, 6)      # global delta
+#     out[:, 210:276] = joints_delta.reshape(T, 66)
+
+#     # 6) 把（可能被正交化后的）poses6d 写回原向量，保持一致
+#     out[:, 3:135] = rot6d.reshape(T, 132)
+
+#     return out
 
 class MusicToDanceGenerator:
     def __init__(self, 
@@ -31,9 +91,25 @@ class MusicToDanceGenerator:
         
         # 加载VAE
         print("Loading VAE...")
-        vae_checkpoint = torch.load(vae_path, map_location=device)
-        vae_args = vae_checkpoint.get('args', None)
+        # vae_checkpoint = torch.load(vae_path, map_location=device)
+        # vae_args = vae_checkpoint.get('args', None)
         
+        # self.vae = AutoMldVae(
+        #     nfeats=276,
+        #     latent_dim=[1, 256],
+        #     h_dim=256,
+        #     num_layers=7,
+        #     ff_size=1024,
+        #     num_heads=4,
+        #     arch='all_encoder',
+        # ).to(device)
+        
+        # self.vae.load_state_dict(vae_checkpoint['model_state_dict'])
+        # self.vae.eval()
+        
+        # print(f"VAE loaded. Latent mean: {self.vae.latent_mean}, std: {self.vae.latent_std}")
+        vae_checkpoint = torch.load(vae_path, map_location=device)
+
         self.vae = AutoMldVae(
             nfeats=276,
             latent_dim=[1, 256],
@@ -43,12 +119,29 @@ class MusicToDanceGenerator:
             num_heads=4,
             arch='all_encoder',
         ).to(device)
-        
-        self.vae.load_state_dict(vae_checkpoint['model_state_dict'])
+
+        model_state_dict = vae_checkpoint['model_state_dict']
+        # 和训练脚本一致：如果checkpoint缺键，给默认值
+        if 'latent_mean' not in model_state_dict:
+            model_state_dict['latent_mean'] = torch.tensor(0)
+        if 'latent_std' not in model_state_dict:
+            model_state_dict['latent_std'] = torch.tensor(1)
+
+        self.vae.load_state_dict(model_state_dict)
+        # 和训练脚本一致：强制写回（训练脚本明确说 load_state_dict 可能不生效）
+        self.vae.latent_mean = model_state_dict['latent_mean']
+        self.vae.latent_std = model_state_dict['latent_std']
+
         self.vae.eval()
-        
         print(f"VAE loaded. Latent mean: {self.vae.latent_mean}, std: {self.vae.latent_std}")
-        
+        # ===== HARD GUARD: latent_std must be > 0 =====
+        try:
+            _ls = float(self.vae.latent_std.item())
+        except Exception:
+            _ls = float(self.vae.latent_std)  # fallback
+        if _ls == 0.0:
+            print("[WARN] vae.latent_std is 0. Force disabling latent scaling in inference.")
+        # =============================================
         # 加载Denoiser
         print("Loading Denoiser...")
         denoiser_checkpoint = torch.load(denoiser_path, map_location=device)
@@ -97,6 +190,14 @@ class MusicToDanceGenerator:
         self.denoiser.eval()
         
         print("Denoiser loaded successfully")
+        # self.smpl_model = SMPLX(
+        #     model_path="./data/smplx_lockedhead_20230207/models_lockedhead/smplx",
+        #     gender="neutral",
+        #     use_pca=False,
+        #     num_pca_comps=12,
+        #     batch_size=1
+        # ).to(self.device)
+        # self.smpl_model.eval()
         
         # 创建Diffusion
         self.diffusion = self._create_diffusion()
@@ -155,14 +256,20 @@ class MusicToDanceGenerator:
             # 根据音乐长度计算primitive数量
             num_primitives = len(music_features) // future_length
         
-        # 初始化历史
+        # 初始化历史（必须与训练分布对齐：归一化后应接近0）
+        if self.motion_mean is None or self.motion_std is None:
+            raise RuntimeError("Normalization params not set. Call set_normalization() before generate().")
+
         if history_motion is None:
-            # 使用站立姿势作为初始历史
-            history_motion = torch.zeros(history_length, 276).to(self.device)
+            # 用训练集均值作为“中性姿态”历史：normalize后严格为0
+            mean_276 = self.motion_mean.reshape(-1)  # 兼容 [276] 或 [1,276]
+            assert mean_276.numel() == 276, f"motion_mean should have 276 elements, got {mean_276.numel()}"
+            history_motion = mean_276.unsqueeze(0).repeat(history_length, 1)  # [H,276]
         else:
             history_motion = torch.from_numpy(history_motion).float().to(self.device)
-        
-        # 归一化历史
+            # 如果用户传入的是未归一化的原始276维，这里统一按原始处理并归一化
+            # （如果你确认传入已经是归一化的，请不要走这个分支）
+        # 归一化历史（训练时history就是归一化后的）
         history_motion = self.normalize(history_motion)
         
         all_motion = []
@@ -205,9 +312,53 @@ class MusicToDanceGenerator:
                 latent, 
                 history_motion.unsqueeze(0),  # [1, H, 276]
                 nfuture=future_length,
-                scale_latent=1
+                scale_latent=0
             )  # [1, F, 276]
-            
+            # # === 关键：把未来片段先从“归一化空间”还原到原始空间，再做自洽重建，再归一化回去 ===
+            # fm = future_motion[0]  # [T,276] 仍是归一化空间
+            # fm_denorm = self.denormalize(fm)  # -> 原始空间
+            # fm_denorm = rebuild_276_consistent(fm_denorm, self.smpl_model)  # 重新算 joints/deltas，保证自洽
+            # fm = self.normalize(fm_denorm)  # 再归一化回去
+            # future_motion = fm.unsqueeze(0)
+            # # ==========================================================================================
+            # # ========= 推理阶段根治：对VAE输出的6D做正交化 + 幅度限制 =========
+            # # future_motion: [1, T, 276]，仍在“归一化空间”
+            # fm = future_motion[0]  # [T,276]
+
+            # # 取出6D：global(6) + body(126) 共132维
+            # poses6d = fm[:, 3:135].reshape(-1, 22, 6)  # [T,22,6]
+
+            # def gram_schmidt_6d(x):
+            #     a1 = x[..., 0:3]
+            #     a2 = x[..., 3:6]
+            #     b1 = a1 / (torch.norm(a1, dim=-1, keepdim=True) + 1e-8)
+            #     dot = torch.sum(a2 * b1, dim=-1, keepdim=True)
+            #     b2 = a2 - dot * b1
+            #     b2 = b2 / (torch.norm(b2, dim=-1, keepdim=True) + 1e-8)
+            #     return torch.cat([b1, b2], dim=-1)
+
+            # poses6d = gram_schmidt_6d(poses6d)
+
+            # # 可选：角度幅度限制（建议保留，避免爆角再次出现）
+            # from pytorch3d import transforms
+            # R = transforms.rotation_6d_to_matrix(poses6d.reshape(-1,6)).reshape(-1,22,3,3)
+            # aa = transforms.matrix_to_axis_angle(R.reshape(-1,3,3)).reshape(-1,22,3)
+
+            # MAX_BODY = 0.6
+            # MAX_GLOBAL = 2.0
+            # angle = torch.norm(aa, dim=-1, keepdim=True) + 1e-8
+            # max_angle = torch.ones_like(angle) * MAX_BODY
+            # max_angle[:, 0:1, :] = MAX_GLOBAL  # joint0(global)稍大
+            # scale = torch.clamp(max_angle / angle, max=1.0)
+            # aa = aa * scale
+            # R = transforms.axis_angle_to_matrix(aa.reshape(-1,3)).reshape(-1,22,3,3)
+
+            # # 转回6D写回motion
+            # poses6d = transforms.matrix_to_rotation_6d(R.reshape(-1,3,3)).reshape(-1,22,6)
+            # fm[:, 3:135] = poses6d.reshape(-1,132)
+
+            # future_motion = fm.unsqueeze(0)
+            # # ============================================================
             future_motion = future_motion.squeeze(0)  # [F, 276]
             
             # 添加到结果
@@ -249,27 +400,27 @@ def save_motion_for_visualization(motion, output_path, gender='male'):
     
     poses_6d_t = torch.from_numpy(poses_6d).float()
     
-    # 【关键修复】对6D表示进行Gram-Schmidt正交化
-    # 确保每个6D向量代表有效的旋转
-    def gram_schmidt_6d(x):
-        """Gram-Schmidt正交化6D表示"""
-        a1 = x[..., :3]
-        a2 = x[..., 3:6]
+    # # 【关键修复】对6D表示进行Gram-Schmidt正交化
+    # # 确保每个6D向量代表有效的旋转
+    # def gram_schmidt_6d(x):
+    #     """Gram-Schmidt正交化6D表示"""
+    #     a1 = x[..., :3]
+    #     a2 = x[..., 3:6]
         
-        # 归一化第一个向量
-        b1 = a1 / (torch.norm(a1, dim=-1, keepdim=True) + 1e-8)
+    #     # 归一化第一个向量
+    #     b1 = a1 / (torch.norm(a1, dim=-1, keepdim=True) + 1e-8)
         
-        # 正交化第二个向量
-        dot = torch.sum(a2 * b1, dim=-1, keepdim=True)
-        b2 = a2 - dot * b1
-        b2 = b2 / (torch.norm(b2, dim=-1, keepdim=True) + 1e-8)
+    #     # 正交化第二个向量
+    #     dot = torch.sum(a2 * b1, dim=-1, keepdim=True)
+    #     b2 = a2 - dot * b1
+    #     b2 = b2 / (torch.norm(b2, dim=-1, keepdim=True) + 1e-8)
         
-        return torch.cat([b1, b2], dim=-1)
+    #     return torch.cat([b1, b2], dim=-1)
     
-    # Reshape, 正交化, 再reshape回来
-    poses_6d_reshaped = poses_6d_t.reshape(T, 22, 6)  # 1 global + 21 body
-    poses_6d_normalized = gram_schmidt_6d(poses_6d_reshaped)
-    poses_6d_t = poses_6d_normalized.reshape(T, 132)
+    # # Reshape, 正交化, 再reshape回来
+    # poses_6d_reshaped = poses_6d_t.reshape(T, 22, 6)  # 1 global + 21 body
+    # poses_6d_normalized = gram_schmidt_6d(poses_6d_reshaped)
+    # poses_6d_t = poses_6d_normalized.reshape(T, 132)
     
     # 分离global_orient和body_pose
     global_orient_6d = poses_6d_t[:, :6]  # [T, 6]
@@ -278,7 +429,29 @@ def save_motion_for_visualization(motion, output_path, gender='male'):
     # 转换为旋转矩阵
     global_orient = transforms.rotation_6d_to_matrix(global_orient_6d)  # [T, 3, 3]
     body_pose = transforms.rotation_6d_to_matrix(body_pose_6d)  # [T, 21, 3, 3]
-    
+    # # ========= 修复：限制axis-angle幅度，防止关节爆角导致SMPL扭曲 =========
+    # # 把旋转矩阵转成axis-angle
+    # global_aa = transforms.matrix_to_axis_angle(global_orient)                 # [T,3]
+    # body_aa = transforms.matrix_to_axis_angle(body_pose.reshape(T*21, 3, 3))   # [T*21,3]
+    # body_aa = body_aa.reshape(T, 21, 3)                                        # [T,21,3]
+
+    # def clamp_axis_angle(aa, max_angle):
+    #     # aa: [..., 3]
+    #     angle = torch.norm(aa, dim=-1, keepdim=True) + 1e-8
+    #     scale = torch.clamp(max_angle / angle, max=1.0)
+    #     return aa * scale
+
+    # # 经验上：global可以稍大，body关节严格一些（你也可以后面调）
+    # MAX_GLOBAL = 1.5   # 弧度，约114°
+    # MAX_BODY   = 0.6   
+
+    # global_aa = clamp_axis_angle(global_aa, MAX_GLOBAL)
+    # body_aa   = clamp_axis_angle(body_aa,   MAX_BODY)
+
+    # # 转回旋转矩阵（写进pkl的就是被限制后的姿态）
+    # global_orient = transforms.axis_angle_to_matrix(global_aa)                 # [T,3,3]
+    # body_pose = transforms.axis_angle_to_matrix(body_aa.reshape(T*21, 3)).reshape(T, 21, 3, 3)
+    # # ============================================================================
     # 保存为pickle
     result = {
         'gender': gender,
@@ -346,8 +519,14 @@ def main():
         music_features,
         num_primitives=args.num_primitives
     )
-    print(f"Generated motion shape: {motion.shape}")
-    
+    # from utils.rot6d import enforce_pose6d_132
+
+    # # motion: [T,276] torch
+    # pose6d = motion[:, 3:135].reshape(-1,22,6)
+    # n1 = pose6d[...,:3].norm(dim=-1).mean().item()
+    # n2 = pose6d[...,3:].norm(dim=-1).mean().item()
+    # dot = (pose6d[...,:3]*pose6d[...,3:]).sum(dim=-1).abs().mean().item()
+    # print("[DEBUG] gen pose6d stats:", n1, n2, dot)
     # 保存结果
     output_path = output_dir / 'generated_dance.pkl'
     save_motion_for_visualization(motion, output_path, gender=args.gender)

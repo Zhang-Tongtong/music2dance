@@ -9,7 +9,7 @@ import loralib as lora
 class DenoiserMLP(nn.Module):
     def __init__(self,
                  h_dim=512, n_blocks=2, dropout: float = 0.1, activation="gelu",
-                 music_dim=35, history_shape=(2, 276), noise_shape=(1, 128),
+                 music_dim=35, history_shape=(2, 276), noise_shape=(1, 256),
                  **kargs):#改
         super().__init__()
         self.h_dim = h_dim
@@ -75,7 +75,7 @@ class DenoiserMLP(nn.Module):
 class DenoiserTransformer(nn.Module):
     def __init__(self,
                  h_dim=256, ff_size=1024, num_layers=4, num_heads=4, dropout=0.1, activation="gelu",
-                 music_dim=35, history_shape=(2, 276), noise_shape=(1, 128),
+                 music_dim=35, history_shape=(2, 276), noise_shape=(1, 256),
                  **kargs):
         super().__init__()
         self.h_dim = h_dim

@@ -27,6 +27,7 @@ from diffusion.nn import mean_flat, sum_flat
 
 from data_loaders.humanml.data.dataset_finedance import FineDanceDataset
 import sys
+
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -113,7 +114,7 @@ class TrainArgs:
     resume_checkpoint: str | None = None
     log_interval: int = 1000
     val_interval: int = 10000
-    save_interval: int = 100000
+    save_interval: int = 1000
 
     use_predicted_joints: int = 0
     """if set to 1, use predicted joints to rollout, otherwise use the regressed joints from smplx body model"""
@@ -358,6 +359,8 @@ class Trainer:
                 
                 # 使用tensor_to_dict - 保持3D张量
                 motion_dict = dataset.tensor_to_dict(gender_motion_tensor)
+                # motion_dict['poses_6d'] = enforce_pose6d_132(motion_dict['poses_6d'])
+
                 
                 # motion_dict现在包含:
                 # 'transl': [sub_batch_size, T, 3]
@@ -508,8 +511,9 @@ class Trainer:
 
     def get_primitive_batch(self, batch, primitive_idx):
         motion = batch[primitive_idx]['motion_tensor_normalized']  # [bs, D, 1, T]
-        cond = {'y': {'text': batch[primitive_idx]['texts'],
-                      'text_embedding': batch[primitive_idx]['text_embedding'],  # [bs, 512]
+        cond = {'y': {
+                    #   'text': batch[primitive_idx]['texts'],
+                    #   'text_embedding': batch[primitive_idx]['text_embedding'],  # [bs, 512]
                       'gender': batch[primitive_idx]['gender'],
                       'betas': batch[primitive_idx]['betas'],  # [bs, T, 10]
                       'history_motion': batch[primitive_idx]['history_motion'],  # [bs, D, 1, T]
@@ -566,34 +570,74 @@ class Trainer:
         else:
             return rollout_history
 
+    # def get_latent_scale(self, model):
+    #     """
+    #     get the scale of the latent space
+    #         model: model or model_avg
+    #     """
+    #     original_mode = model.training
+    #     model.eval()
+
+    #     train_args = self.args.train_args
+    #     future_length = self.train_dataset.future_length
+    #     history_length = self.train_dataset.history_length
+    #     num_primitive = self.train_dataset.num_primitive
+
+    #     with torch.no_grad():
+    #         batch = self.train_dataset.get_batch(self.batch_size)
+    #         primitive_idx = 0
+    #         motion, cond = self.get_primitive_batch(batch, primitive_idx)
+    #         motion_tensor = motion.squeeze(2).permute(0, 2, 1)  # [B, T, D]
+    #         future_motion_gt = motion_tensor[:, -future_length:, :]
+    #         history_motion = motion_tensor[:, :history_length, :]
+
+    #         latent, dist = model.encode(future_motion=future_motion_gt, history_motion=history_motion)  # [1, B, D]
+    #         all_mean = latent.mean()
+    #         all_std = (latent - all_mean).pow(2).mean().sqrt()
+    #         model.register_buffer("latent_mean", all_mean)
+    #         model.register_buffer("latent_std", all_std)
+    #         print(f"latent mean: {all_mean}, latent std: {all_std}")
+
+    #     model.train(original_mode)
     def get_latent_scale(self, model):
-        """
-        get the scale of the latent space
-            model: model or model_avg
-        """
+        """Robust latent mean/std estimation and write-back to existing buffers."""
         original_mode = model.training
         model.eval()
 
-        train_args = self.args.train_args
         future_length = self.train_dataset.future_length
         history_length = self.train_dataset.history_length
-        num_primitive = self.train_dataset.num_primitive
 
+        # 统计更多样本，避免std被偶然算成0
+        latents = []
         with torch.no_grad():
-            batch = self.train_dataset.get_batch(self.batch_size)
-            primitive_idx = 0
-            motion, cond = self.get_primitive_batch(batch, primitive_idx)
-            motion_tensor = motion.squeeze(2).permute(0, 2, 1)  # [B, T, D]
-            future_motion_gt = motion_tensor[:, -future_length:, :]
-            history_motion = motion_tensor[:, :history_length, :]
+            for _ in range(64):  # 64个batch，够稳定；你想更稳可以调到128
+                batch = self.train_dataset.get_batch(self.batch_size)
+                primitive_idx = 0  # 用第一个primitive就行
+                motion, cond = self.get_primitive_batch(batch, primitive_idx)
+                motion_tensor = motion.squeeze(2).permute(0, 2, 1)  # [B, T, D]
+                future_motion_gt = motion_tensor[:, -future_length:, :]
+                history_motion = motion_tensor[:, :history_length, :]
 
-            latent, dist = model.encode(future_motion=future_motion_gt, history_motion=history_motion)  # [1, B, D]
-            all_mean = latent.mean()
-            all_std = (latent - all_mean).pow(2).mean().sqrt()
-            model.register_buffer("latent_mean", all_mean)
-            model.register_buffer("latent_std", all_std)
-            print(f"latent mean: {all_mean}, latent std: {all_std}")
+                latent, _ = model.encode(future_motion=future_motion_gt, history_motion=history_motion)
+                latents.append(latent.detach().reshape(-1))  # 拉平成一维
 
+        latents = torch.cat(latents, dim=0)
+        all_mean = latents.mean()
+        all_std = latents.std(unbiased=False).clamp_min(1e-4)  # 永远不允许为0
+
+        # ===== 关键：不要register_buffer(会重复注册/可能不生效)，而是写回已有buffer =====
+        if "latent_mean" in model._buffers and model._buffers["latent_mean"] is not None:
+            model._buffers["latent_mean"].data = all_mean.detach()
+        else:
+            model.register_buffer("latent_mean", all_mean.detach())
+
+        if "latent_std" in model._buffers and model._buffers["latent_std"] is not None:
+            model._buffers["latent_std"].data = all_std.detach()
+        else:
+            model.register_buffer("latent_std", all_std.detach())
+        # ========================================================================
+
+        print(f"[latent_scale] mean: {float(all_mean):.6f}, std: {float(all_std):.6f}")
         model.train(original_mode)
 
     def save(self):

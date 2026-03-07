@@ -34,6 +34,22 @@ def convert_smpl_aa_to_rotmat(smplx_param):
 
 def get_smplx_param_from_6d(primitive_data):
     body_param = {}
+        # ========= 根本修复：把任意6D投影成合法旋转(单位正交) =========
+    def gram_schmidt_6d(x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [..., 6]
+        return: [..., 6]  (b1,b2) 两个单位正交向量
+        """
+        a1 = x[..., 0:3]
+        a2 = x[..., 3:6]
+
+        b1 = a1 / (torch.norm(a1, dim=-1, keepdim=True) + 1e-8)
+        dot = torch.sum(a2 * b1, dim=-1, keepdim=True)
+        b2 = a2 - dot * b1
+        b2 = b2 / (torch.norm(b2, dim=-1, keepdim=True) + 1e-8)
+
+        return torch.cat([b1, b2], dim=-1)
+    # ==========================================================
     if 'gender' in primitive_data:
         body_param['gender'] = primitive_data['gender']
     batch_size = primitive_data['transl'].shape[0]
@@ -49,23 +65,32 @@ def get_smplx_param_from_6d(primitive_data):
     # body_pose_6d = poses_6d[:, 6:132]   # [B, 126]
     # 如果是126维，说明只有body_pose，需要处理
     if poses_6d.shape[-1] == 126:
-        global_orient = transforms.axis_angle_to_matrix(torch.zeros(batch_size, 3, device=poses_6d.device))
-        body_pose = transforms.rotation_6d_to_matrix(poses_6d.reshape(-1, 6)).reshape(-1, 21, 3, 3)
+        # 126维：只有body_pose(21*6)，先强制正交化再转旋转矩阵
+        global_orient = transforms.axis_angle_to_matrix(
+            torch.zeros(batch_size, 3, device=poses_6d.device)
+        )
+
+        body_pose_6d = poses_6d.reshape(-1, 21, 6)                 # [B,21,6]
+        body_pose_6d = gram_schmidt_6d(body_pose_6d)               # [B,21,6] 关键：正交化
+        body_pose = transforms.rotation_6d_to_matrix(
+            body_pose_6d.reshape(-1, 6)
+        ).reshape(-1, 21, 3, 3)
     elif poses_6d.shape[-1] == 132:
-        # 新格式：global_orient(6) + body_pose(126)
-        global_orient_6d = poses_6d[:, :6]  # [B, 6]        
-        body_pose_6d = poses_6d[:, 6:132]   # [B, 126]
-        # 调试信息
-        if global_orient_6d.shape[1] != 6:
-            print(f"ERROR - global_orient_6d shape: {global_orient_6d.shape}")
-            print(f"ERROR - poses_6d shape: {poses_6d.shape}")
-            raise ValueError(f"global_orient_6d should be [B, 6], got {global_orient_6d.shape}")
-        
-        # 转换6D到旋转矩阵
-        global_orient = transforms.rotation_6d_to_matrix(global_orient_6d)  # [B, 3, 3]
-        body_pose_6d_reshaped = body_pose_6d.reshape(-1, 21, 6)  # [B, 21, 6]
-        body_pose = transforms.rotation_6d_to_matrix(body_pose_6d_reshaped.reshape(-1, 6))  # [B*21, 3, 3]
-        body_pose = body_pose.reshape(-1, 21, 3, 3)  # [B, 21, 3, 3]
+        # 132维：global_orient(6) + body_pose(21*6)
+        global_orient_6d = poses_6d[:, :6]                 # [B,6]
+        body_pose_6d = poses_6d[:, 6:132].reshape(-1, 21, 6)  # [B,21,6]
+
+        # ========= 关键：先正交化再转旋转矩阵 =========
+        global_orient_6d = gram_schmidt_6d(global_orient_6d)   # [B,6]
+        assert torch.isfinite(global_orient_6d).all(), "global_orient_6d has NaN/Inf after GS"
+        body_pose_6d = gram_schmidt_6d(body_pose_6d)           # [B,21,6]
+        assert torch.isfinite(body_pose_6d).all(), "body_pose_6d has NaN/Inf after GS"
+        # ============================================
+
+        global_orient = transforms.rotation_6d_to_matrix(global_orient_6d)  # [B,3,3]
+        body_pose = transforms.rotation_6d_to_matrix(
+            body_pose_6d.reshape(-1, 6)
+        ).reshape(-1, 21, 3, 3)
     else:
         raise ValueError(f"Unexpected poses_6d dimension: {poses_6d.shape[-1]}, expected 126 or 132")
     
