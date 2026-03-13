@@ -5,7 +5,7 @@ import pdb
 import random
 import time
 from typing import Literal
-from dataclasses import dataclass, asdict, make_dataclass
+from dataclasses import dataclass, asdict, make_dataclass,field
 
 import numpy as np
 import torch
@@ -60,6 +60,7 @@ class DenoiserMLPArgs:
     """probability of masking the conditioning input"""
 
     music_dim: int = 35
+    music_nframes: int = 8
     history_shape: tuple = (2, 276)
     noise_shape: tuple = (1, 128) # 注意: 这个要和VAE的latent_dim匹配
 
@@ -77,6 +78,7 @@ class DenoiserTransformerArgs:
     """probability of masking the conditioning input"""
 
     music_dim: int = 35
+    music_nframes: int = 8
     history_shape: tuple = (2, 276)
     noise_shape: tuple = (1, 128)
 
@@ -86,15 +88,15 @@ class DenoiserArgs:
     mvae_path: str = ''
     rescale_latent: int = 1
 
-    train_rollout_type: Literal["single", "full"] = "full"
+    train_rollout_type: Literal["single", "full"] = "single"
     """whether to use the full denoising loop to generate the previous primitive or a single step in rollout training"""
     train_rollout_history: str = "rollout"  # "rollout" or "gt"
 
-    model_type: str = "mlp"
-    model_args: DenoiserMLPArgs | DenoiserTransformerArgs = DenoiserMLPArgs()
+    model_type: Literal["mlp", "transformer"] = "transformer"
+    model_args: DenoiserMLPArgs | DenoiserTransformerArgs = field(default_factory=DenoiserTransformerArgs)
     """choose model type, either mlp or transformer"""
 
-    diffusion_args: DiffusionArgs = DiffusionArgs()
+    diffusion_args: DiffusionArgs = field(default_factory=DiffusionArgs)
 
 
 @dataclass
@@ -233,6 +235,7 @@ class Trainer:
         assert mvae_args.data_args.feature_dim == data_args.feature_dim
         denoiser_model_args.history_shape = (data_args.history_length, data_args.feature_dim)
         denoiser_model_args.noise_shape = mvae_args.model_args.latent_dim
+        denoiser_model_args.music_nframes = data_args.future_length
 
         run_name = f"{args.exp_name}__seed{args.seed}__{int(time.time())}"
         if args.track:
@@ -285,11 +288,58 @@ class Trainer:
             param.requires_grad = False
         vae_model.eval()
 
-        denoiser_class = DenoiserMLP if isinstance(denoiser_model_args, DenoiserMLPArgs) else DenoiserTransformer
-        denoiser_args.model_type = "mlp" if isinstance(denoiser_model_args, DenoiserMLPArgs) else "transformer"
+        # denoiser_class = DenoiserMLP if isinstance(denoiser_model_args, DenoiserMLPArgs) else DenoiserTransformer
+        # denoiser_args.model_type = "mlp" if isinstance(denoiser_model_args, DenoiserMLPArgs) else "transformer"
+        # denoiser_model = denoiser_class(
+        #     **asdict(denoiser_model_args),
+        # ).to(device)
+        # 强制按 model_type 选择模型，不再依赖 isinstance(model_args, ...)
+        if denoiser_args.model_type == "transformer":
+            if not isinstance(denoiser_model_args, DenoiserTransformerArgs):
+                # 从旧的 mlp args 平滑转换到 transformer args
+                denoiser_model_args = DenoiserTransformerArgs(
+                    h_dim=getattr(denoiser_model_args, "h_dim", 512),
+                    ff_size=1024,
+                    num_layers=8,
+                    num_heads=4,
+                    dropout=getattr(denoiser_model_args, "dropout", 0.1),
+                    activation=getattr(denoiser_model_args, "activation", "gelu"),
+                    cond_mask_prob=getattr(denoiser_model_args, "cond_mask_prob", 0.1),
+                    music_dim=getattr(denoiser_model_args, "music_dim", 35),
+                    music_nframes=data_args.future_length,
+                    history_shape=(data_args.history_length, data_args.feature_dim),
+                    noise_shape=mvae_args.model_args.latent_dim,
+                )
+            denoiser_class = DenoiserTransformer
+
+        elif denoiser_args.model_type == "mlp":
+            if not isinstance(denoiser_model_args, DenoiserMLPArgs):
+                denoiser_model_args = DenoiserMLPArgs(
+                    h_dim=getattr(denoiser_model_args, "h_dim", 512),
+                    n_blocks=2,
+                    dropout=getattr(denoiser_model_args, "dropout", 0.1),
+                    activation=getattr(denoiser_model_args, "activation", "gelu"),
+                    cond_mask_prob=getattr(denoiser_model_args, "cond_mask_prob", 0.1),
+                    music_dim=getattr(denoiser_model_args, "music_dim", 35),
+                    music_nframes=data_args.future_length,
+                    history_shape=(data_args.history_length, data_args.feature_dim),
+                    noise_shape=mvae_args.model_args.latent_dim,
+                )
+            denoiser_class = DenoiserMLP
+
+        else:
+            raise ValueError(f"Unknown denoiser model_type: {denoiser_args.model_type}")
+
+        # 统一补齐 shape
+        denoiser_model_args.history_shape = (data_args.history_length, data_args.feature_dim)
+        denoiser_model_args.noise_shape = mvae_args.model_args.latent_dim
+        if hasattr(denoiser_model_args, "music_nframes"):
+            denoiser_model_args.music_nframes = data_args.future_length
+
         denoiser_model = denoiser_class(
             **asdict(denoiser_model_args),
         ).to(device)
+
         print('denoiser model type:', denoiser_args.model_type)
         print('denoiser model args:', asdict(denoiser_model_args))
         optimizer = optim.AdamW(denoiser_model.parameters(), lr=train_args.learning_rate)
@@ -346,6 +396,10 @@ class Trainer:
         # latent rec loss
         latent_rec_loss = self.rec_criterion(latent_pred, latent_gt)
         terms['latent_rec'] = latent_rec_loss
+        # boundary continuity loss: future 第一帧必须接上 history 最后一帧
+        boundary_pred = future_motion_pred[:, 0, :]   # [B, 276]
+        boundary_hist = history_motion[:, -1, :]      # [B, 276]
+        terms['boundary'] = self.rec_criterion(boundary_pred, boundary_hist)
 
         """smplx consistency losses"""
         dataset = self.train_dataset
@@ -425,7 +479,8 @@ class Trainer:
                train_args.weight_joints_consistency * terms['joints_consistency'] + \
                train_args.weight_joints_delta * terms["joints_delta"] + \
                train_args.weight_transl_delta * terms["transl_delta"] + \
-               train_args.weight_orient_delta * terms["orient_delta"]
+               train_args.weight_orient_delta * terms["orient_delta"] + \
+               train_args.weight_boundary * terms['boundary']
         terms['loss'] = loss
         # for key in terms:
         #     print(f"{key}: {terms[key].item()}")
@@ -461,20 +516,41 @@ class Trainer:
         # denoise
         y = {
             # 'text_embedding': cond['y']['text_embedding'],
-            'music_embedding': cond['y']['music_embedding'], 
+            # 'music_embedding': cond['y']['music_embedding'], 
+            'music_seq': cond['y']['music_seq'].float(),   # [B, F, 35]
             'history_motion_normalized': history_motion,
         }
         x_start_pred = self.denoiser_model(x_t=x_t, timesteps=self.diffusion._scale_timesteps(t), y=y)  # [B, T=1, D]
         latent_pred = x_start_pred.permute(1, 0, 2)  # [T=1, B, D]
-        if torch.isnan(latent_pred).any() or torch.isinf(latent_pred).any():
-            print("latent_pred exploded")
-            exit()
+        # if torch.isnan(latent_pred).any() or torch.isinf(latent_pred).any():
+        #     print("latent_pred exploded")
+        #     exit()
+        if not torch.isfinite(latent_pred).all():
+            raise RuntimeError("latent_pred has NaN/Inf")
 
-        future_motion_pred = self.vae_model.decode(latent_pred, history_motion, nfuture=future_length,
-                                                   scale_latent=denoiser_args.rescale_latent)  # [B, F, D], normalized
+        # future_motion_pred = self.vae_model.decode(latent_pred, history_motion, nfuture=future_length,
+        #                                            scale_latent=denoiser_args.rescale_latent)  # [B, F, D], normalized
+        with torch.no_grad():
+            with amp.autocast(enabled=False):
+                future_motion_pred = self.vae_model.decode(
+                    latent_pred,
+                    history_motion.float(),
+                    nfuture=future_length,
+                    scale_latent=denoiser_args.rescale_latent,
+                ).float()
 
-        loss_dict = self.calc_loss(motion, cond, history_motion, future_motion_gt, future_motion_pred, latent_gt, latent_pred, weights)
+        # loss_dict = self.calc_loss(motion, cond, history_motion, future_motion_gt, future_motion_pred, latent_gt, latent_pred, weights)
 
+        loss_dict = self.calc_loss(
+            motion,
+            cond,
+            history_motion.float(),
+            future_motion_gt.float(),
+            future_motion_pred.float(),
+            latent_gt.float(),
+            latent_pred.float(),
+            weights.float()
+        )
         if self.step > train_args.stage1_steps and self.args.denoiser_args.train_rollout_type == "full":  # sample with full ddpm loop to get rollout history
             sample_fn = self.diffusion.p_sample_loop
             with torch.no_grad():
@@ -533,26 +609,37 @@ class Trainer:
             # t2 = time.time()
             last_primitive = None
             for primitive_idx in range(num_primitive):
-                with amp.autocast(enabled=bool(train_args.use_amp), dtype=torch.float16):
-                    motion, cond = self.get_primitive_batch(batch, primitive_idx)
-                    loss_dict, future_motion_pred = self.common_step(motion, cond, last_primitive)
-                    loss = loss_dict['loss']
+                # with amp.autocast(enabled=bool(train_args.use_amp), dtype=torch.float16):
+                motion, cond = self.get_primitive_batch(batch, primitive_idx)
+                loss_dict, future_motion_pred = self.common_step(motion, cond, last_primitive)
+                loss = loss_dict['loss']
 
                 # optimize
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 if train_args.use_amp:
                     self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(optimizer)   # 让 clip 用 fp32 梯度
-                    nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
+                    self.scaler.unscale_(optimizer)
+                    grad_norm = nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
+
+                    if not torch.isfinite(grad_norm):
+                        print(f"[WARN] non-finite grad_norm at step {self.step}: {grad_norm}")
+                        optimizer.zero_grad(set_to_none=True)
+                        self.scaler.update()
+                    else:
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
                 else:
                     loss.backward()
-                    nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
-                    optimizer.step()
+                    grad_norm = nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
+                    if not torch.isfinite(grad_norm):
+                        print(f"[WARN] non-finite grad_norm at step {self.step}: {grad_norm}")
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        optimizer.step()
                 # loss.backward()
                 # nn.utils.clip_grad_norm_(denoiser_model.parameters(), train_args.grad_clip)
                 # optimizer.step()
+                writer.add_scalar("charts/grad_norm", float(grad_norm), self.step)
 
                 # update the average model using exponential moving average
                 if train_args.ema_decay > 0:
@@ -588,7 +675,8 @@ class Trainer:
         cond = {'y': {
                     #   'text': batch[primitive_idx]['texts'],
                     #   'text_embedding': batch[primitive_idx]['text_embedding'],  # [bs, 512]
-                      'music_embedding': batch[primitive_idx]['music_embedding'],
+                    #   'music_embedding': batch[primitive_idx]['music_embedding'],
+                      'music_seq': batch[primitive_idx]['music_seq'].float(),
                       'gender': batch[primitive_idx]['gender'],
                       'betas': batch[primitive_idx]['betas'],  # [bs, T, 10]
                       'history_motion': batch[primitive_idx]['history_motion'],  # [bs, D, 1, T]

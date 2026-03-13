@@ -114,7 +114,8 @@ class TrainArgs:
     resume_checkpoint: str | None = None
     log_interval: int = 1000
     val_interval: int = 10000
-    save_interval: int = 1000
+    save_interval: int = 10000
+    weight_boundary: float = 1.0
 
     use_predicted_joints: int = 0
     """if set to 1, use predicted joints to rollout, otherwise use the regressed joints from smplx body model"""

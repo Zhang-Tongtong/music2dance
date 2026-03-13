@@ -29,7 +29,9 @@ class DenoiserMLP(nn.Module):
         self.sequence_pos_encoder = PositionalEncoding(self.h_dim, self.dropout)
         self.embed_timestep = TimestepEmbedder(self.h_dim, self.sequence_pos_encoder)
         # input_dim = self.h_dim + self.clip_dim + np.prod(history_shape) + np.prod(noise_shape)
-        input_dim = self.h_dim + self.music_dim + np.prod(history_shape) + np.prod(noise_shape)
+        # input_dim = self.h_dim + self.music_dim + np.prod(history_shape) + np.prod(noise_shape)
+        self.music_nframes = kargs['music_nframes']
+        input_dim = self.h_dim + self.music_dim * self.music_nframes + np.prod(self.history_shape) + np.prod(self.noise_shape)
         self.input_project = nn.Linear(input_dim, self.h_dim)
 
         self.mlp = MLPBlock(h_dim=h_dim,
@@ -60,7 +62,9 @@ class DenoiserMLP(nn.Module):
         emb_history = y['history_motion_normalized'].reshape(batch_size, np.prod(self.history_shape))  # [bs, History * nfeats]
         force_mask = y.get('uncond', False)
         # emb_text = self.mask_cond(y['text_embedding'], force_mask=force_mask)  # [bs, clip_dim]
-        emb_music = self.mask_cond(y['music_embedding'], force_mask=force_mask)  # [bs, music_dim]
+        # emb_music = self.mask_cond(y['music_embedding'], force_mask=force_mask)  # [bs, music_dim]
+        emb_music = y['music_seq'].reshape(batch_size, self.music_nframes * self.music_dim)
+        emb_music = self.mask_cond(emb_music, force_mask=force_mask)
         emb_noise = x_t.reshape(batch_size, np.prod(self.noise_shape))  # [bs, noise_dim]
         # print('emb_time shape:', emb_time.shape, 'emb_text shape:', emb_text.shape, 'emb_history shape:', emb_history.shape, 'emb_noise shape:', emb_noise.shape)
 
@@ -136,7 +140,18 @@ class DenoiserTransformer(nn.Module):
         emb_history = self.embed_history(y['history_motion_normalized']).permute(1, 0, 2)  # [History, bs, d]
         force_mask = y.get('uncond', False)
         # emb_text = self.embed_text(self.mask_cond(y['text_embedding'], force_mask=force_mask)).unsqueeze(0)  # [1, bs, d]
-        emb_music = self.embed_music(self.mask_cond(y['music_embedding'], force_mask=force_mask)).unsqueeze(0)  # [1, bs, d]
+        # emb_music = self.embed_music(self.mask_cond(y['music_embedding'], force_mask=force_mask)).unsqueeze(0)  # [1, bs, d]
+        music_seq = y['music_seq']   # [B, F, 35]
+
+        if force_mask:
+            music_seq = torch.zeros_like(music_seq)
+        elif self.training and self.cond_mask_prob > 0.:
+            mask = torch.bernoulli(
+                torch.ones(music_seq.shape[0], device=music_seq.device) * self.cond_mask_prob
+            ).view(-1, 1, 1)
+            music_seq = music_seq * (1. - mask)
+
+        emb_music = self.embed_music(music_seq).permute(1, 0, 2)   # [F, B, h_dim]
         emb_noise = self.embed_noise(x_t).permute(1, 0, 2)  # [1, bs, d]
         # print('emb_time shape:', emb_time.shape, 'emb_text shape:', emb_text.shape, 'emb_history shape:', emb_history.shape, 'emb_noise shape:', emb_noise.shape)
 

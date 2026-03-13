@@ -168,6 +168,7 @@ class MusicToDanceGenerator:
                 dropout=0.1,
                 activation='gelu',
                 music_dim=35,
+                music_nframes=8,
                 history_shape=(2, 276),
                 noise_shape=(1, 256),
                 cond_mask_prob=0.0,  # 推理时不mask
@@ -181,6 +182,7 @@ class MusicToDanceGenerator:
                 dropout=0.1,
                 activation='gelu',
                 music_dim=35,
+                music_nframes=8,
                 history_shape=(2, 276),
                 noise_shape=(1, 256),
                 cond_mask_prob=0.0,
@@ -280,16 +282,24 @@ class MusicToDanceGenerator:
             # 提取当前primitive的音乐特征
             start_idx = i * future_length
             end_idx = min((i + 1) * future_length, len(music_features))
-            music_segment = music_features[start_idx:end_idx]
-            
-            # 平均池化得到音乐embedding
-            music_emb = torch.from_numpy(music_segment.mean(0)).float().to(self.device).unsqueeze(0)  # [1, 35]
-            
-            # 准备condition
+            music_segment = music_features[start_idx:end_idx]   # [<=F, 35]
+
+            music_seq = torch.from_numpy(music_segment).float().to(self.device)  # [Tseg, 35]
+
+            # 不够 future_length 就补齐
+            if music_seq.shape[0] < future_length:
+                pad = music_seq[-1:].repeat(future_length - music_seq.shape[0], 1)
+                music_seq = torch.cat([music_seq, pad], dim=0)
+
+            # 如果超过 future_length，就截断
+            music_seq = music_seq[:future_length]  # [F, 35]
+
             y = {
-                'music_embedding': music_emb,
+                'music_seq': music_seq.unsqueeze(0),  # [1, F, 35]
                 'history_motion_normalized': history_motion.unsqueeze(0),  # [1, H, 276]
             }
+            # print("music_seq shape:", y['music_seq'].shape)
+            # print("history_motion_normalized shape:", y['history_motion_normalized'].shape)
             
             # 包装成model_kwargs格式
             model_kwargs = {'y': y}
@@ -312,7 +322,7 @@ class MusicToDanceGenerator:
                 latent, 
                 history_motion.unsqueeze(0),  # [1, H, 276]
                 nfuture=future_length,
-                scale_latent=0
+                scale_latent=1
             )  # [1, F, 276]
             # # === 关键：把未来片段先从“归一化空间”还原到原始空间，再做自洽重建，再归一化回去 ===
             # fm = future_motion[0]  # [T,276] 仍是归一化空间
